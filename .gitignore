@@ -1,0 +1,30 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Google OAuth secrets (never commit)
+credentials.json
+token.pickle
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.*
