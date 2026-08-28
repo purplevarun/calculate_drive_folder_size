@@ -1,113 +1,144 @@
 import os
 import re
+import subprocess
 import sys
-import pickle
 from collections import defaultdict
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+
+def load_url_from_env_or_cli(argv):
+    cli_url = argv[1] if len(argv) > 1 else None
+
+    if cli_url:
+        return cli_url
+
+    env_path = ".env"
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as env_file:
+            for line in env_file:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("URL="):
+                    env_url = line.split("=", 1)[1].strip().strip('"\'')
+                    if env_url:
+                        return env_url
+
+    raise ValueError("No URL provided. Pass a CLI argument or set URL= in .env")
 
 
 def extract_folder_id(url):
-    match = re.search(r'folders/([a-zA-Z0-9_-]+)', url)
+    match = re.search(r"/folders/([A-Za-z0-9_-]+)", url)
     if match:
         return match.group(1)
-    else:
-        raise ValueError("Invalid Google Drive folder URL")
+    raise ValueError("Invalid Google Drive folder URL")
 
 
-def authenticate():
-    creds = None
+def fetch_folder_html(folder_id):
+    url = f"https://drive.google.com/embeddedfolderview?id={folder_id}#list"
+    proc = subprocess.run(
+        ["curl", "-sS", "-L", "--http1.1", "--max-time", "30", url],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"curl failed: {proc.stderr.strip() or 'unknown error'}")
 
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
-            creds = pickle.load(token)
+    html = proc.stdout
+    if not html:
+        raise RuntimeError("Received empty response from Google Drive.")
 
-    if not creds or not creds.valid:
-        flow = InstalledAppFlow.from_client_secrets_file(
-            'credentials.json', SCOPES
-        )
-        creds = flow.run_local_server(port=0)
+    if "<title>Sign in - Google Accounts</title>" in html:
+        raise PermissionError("This folder is not publicly accessible. Please share it publicly and try again.")
 
-        with open('token.pickle', 'wb') as token:
-            pickle.dump(creds, token)
-
-    return build('drive', 'v3', credentials=creds)
+    return html
 
 
-def analyze_folder(service, folder_id):
-    page_token = None
+def parse_entries(html):
+    pattern = re.compile(
+        r'<div class="flip-entry" id="entry-(?P<id>[A-Za-z0-9_-]+)".*?'
+        r'<a href="(?P<href>[^"]+)"[^>]*>.*?'
+        r'<div class="flip-entry-title">(?P<name>.*?)</div>',
+        re.S,
+    )
+
+    entries = []
+    seen = set()
+
+    for match in pattern.finditer(html):
+        item_id = match.group("id")
+        if item_id in seen:
+            continue
+        seen.add(item_id)
+
+        href = match.group("href")
+        name = re.sub(r"\s+", " ", match.group("name")).strip()
+        entries.append({
+            "id": item_id,
+            "name": name,
+            "is_folder": "/folders/" in href,
+            "href": href,
+        })
+
+    return entries
+
+
+def analyze_folder(folder_id, visited=None):
+    if visited is None:
+        visited = set()
+    if folder_id in visited:
+        return 0, 0, defaultdict(int)
+
+    visited.add(folder_id)
+    entries = parse_entries(fetch_folder_html(folder_id))
 
     total_files = 0
     total_folders = 0
-    total_size = 0
     type_counts = defaultdict(int)
 
-    while True:
-        results = service.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            spaces='drive',
-            fields="nextPageToken, files(id, name, mimeType, size)",
-            pageToken=page_token
-        ).execute()
+    for entry in entries:
+        if entry["is_folder"]:
+            folder_match = re.search(r"/folders/([A-Za-z0-9_-]+)", entry["href"])
+            sub_id = folder_match.group(1) if folder_match else entry["id"]
+            sub_files, sub_folders, sub_counts = analyze_folder(sub_id, visited)
+            total_files += sub_files
+            total_folders += sub_folders + 1
+            for key, value in sub_counts.items():
+                type_counts[key] += value
+            continue
 
-        items = results.get('files', [])
+        total_files += 1
+        ext = entry["name"].rsplit(".", 1)[-1].lower() if "." in entry["name"] else "no_extension"
+        type_counts[ext] += 1
 
-        for item in items:
-
-            if item['mimeType'] == 'application/vnd.google-apps.folder':
-                total_folders += 1
-
-                # recurse into subfolder
-                sub_files, sub_folders, sub_size, sub_types = analyze_folder(
-                    service, item['id']
-                )
-
-                total_files += sub_files
-                total_folders += sub_folders
-                total_size += sub_size
-
-                for k, v in sub_types.items():
-                    type_counts[k] += v
-
-            else:
-                total_files += 1
-
-                ext = os.path.splitext(item['name'])[1].lower().replace('.', '')
-                if ext:
-                    type_counts[ext] += 1
-                else:
-                    type_counts['no_extension'] += 1
-
-                size = int(item.get('size', 0))
-                total_size += size
-
-        page_token = results.get('nextPageToken')
-        if not page_token:
-            break
-
-    return total_files, total_folders, total_size, type_counts
+    return total_files, total_folders, type_counts
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python main.py <GoogleDriveFolderURL>")
+    try:
+        url = load_url_from_env_or_cli(sys.argv)
+    except ValueError as exc:
+        print(exc)
         sys.exit(1)
 
-    url = sys.argv[1]
-    folder_id = extract_folder_id(url)
+    try:
+        folder_id = extract_folder_id(url)
+    except ValueError as exc:
+        print(exc)
+        sys.exit(1)
 
-    service = authenticate()
-
-    total_files, total_folders, total_size, type_counts = analyze_folder(service, folder_id)
+    try:
+        total_files, total_folders, type_counts = analyze_folder(folder_id)
+    except RuntimeError as exc:
+        print(f"Network/API error while reading folder: {exc}")
+        sys.exit(1)
+    except PermissionError as exc:
+        print(exc)
+        sys.exit(1)
 
     print("\n===== DRIVE FOLDER ANALYSIS =====")
     print(f"Total Folders: {total_folders}")
     print(f"Total Files: {total_files}")
-
     print("\nFile Types:")
     for file_type, count in sorted(type_counts.items()):
         print(f"{file_type}: {count}")
-
-    print(f"\nTotal Size: {round(total_size / (1024**3), 2)} GB")
