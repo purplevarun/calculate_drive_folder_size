@@ -35,23 +35,37 @@ def extract_folder_id(url):
 
 def fetch_folder_html(folder_id):
     url = f"https://drive.google.com/embeddedfolderview?id={folder_id}#list"
-    proc = subprocess.run(
-        ["curl", "-sS", "-L", "--http1.1", "--max-time", "30", url],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"curl failed: {proc.stderr.strip() or 'unknown error'}")
+    last_error = ""
 
-    html = proc.stdout
-    if not html:
-        raise RuntimeError("Received empty response from Google Drive.")
+    for attempt in range(2):
+        proc = subprocess.run(
+            [
+                "curl",
+                "-sS",
+                "-L",
+                "--http1.1",
+                "--connect-timeout",
+                "20",
+                "--max-time",
+                "180",
+                "-A",
+                "Mozilla/5.0",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            html = proc.stdout
+            if html and "<title>Sign in - Google Accounts</title>" not in html:
+                return html
+            last_error = "public access denied or empty response"
+            break
 
-    if "<title>Sign in - Google Accounts</title>" in html:
-        raise PermissionError("This folder is not publicly accessible. Please share it publicly and try again.")
+        last_error = proc.stderr.strip() or "unknown curl error"
 
-    return html
+    raise RuntimeError(f"curl failed: {last_error}")
 
 
 def parse_entries(html):
@@ -73,36 +87,100 @@ def parse_entries(html):
 
         href = match.group("href")
         name = re.sub(r"\s+", " ", match.group("name")).strip()
+
+        file_match = re.search(r"/file/d/([A-Za-z0-9_-]+)", href)
+        folder_match = re.search(r"/folders/([A-Za-z0-9_-]+)", href)
+
         entries.append({
             "id": item_id,
             "name": name,
-            "is_folder": "/folders/" in href,
+            "is_folder": bool(folder_match),
+            "resource_id": file_match.group(1) if file_match else (folder_match.group(1) if folder_match else item_id),
             "href": href,
         })
 
     return entries
 
 
-def analyze_folder(folder_id, visited=None):
+def get_public_file_size(file_id):
+    url = f"https://drive.google.com/uc?export=view&id={file_id}"
+    proc = subprocess.run(
+        [
+            "curl",
+            "-sSL",
+            "--connect-timeout",
+            "20",
+            "--max-time",
+            "90",
+            "-A",
+            "Mozilla/5.0",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{size_download}",
+            url,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+
+    stdout = proc.stdout.strip()
+    if not stdout:
+        return None
+
+    try:
+        return int(stdout)
+    except ValueError:
+        return None
+
+
+def print_progress(message, current=None, total=None, files=None, folders=None):
+    parts = [f"[progress] {message}"]
+    if current is not None and total is not None:
+        parts.append(f"{current}/{total}")
+    if files is not None:
+        parts.append(f"{files} files")
+    if folders is not None:
+        parts.append(f"{folders} folders")
+    print(" | ".join(parts), flush=True)
+
+
+def analyze_folder(folder_id, visited=None, progress_every=50):
     if visited is None:
         visited = set()
     if folder_id in visited:
-        return 0, 0, defaultdict(int)
+        return 0, 0, defaultdict(int), 0
 
     visited.add(folder_id)
     entries = parse_entries(fetch_folder_html(folder_id))
 
     total_files = 0
     total_folders = 0
+    total_size = 0
     type_counts = defaultdict(int)
 
-    for entry in entries:
+    if entries:
+        print_progress("scan started", current=0, total=len(entries), files=0, folders=0)
+
+    for index, entry in enumerate(entries, start=1):
+        should_log = index % progress_every == 0 or index == len(entries)
+        if should_log:
+            print_progress(
+                "scanning",
+                current=index,
+                total=len(entries),
+                files=total_files,
+                folders=total_folders,
+            )
+
         if entry["is_folder"]:
-            folder_match = re.search(r"/folders/([A-Za-z0-9_-]+)", entry["href"])
-            sub_id = folder_match.group(1) if folder_match else entry["id"]
-            sub_files, sub_folders, sub_counts = analyze_folder(sub_id, visited)
+            sub_files, sub_folders, sub_counts, sub_size = analyze_folder(entry["resource_id"], visited, progress_every)
             total_files += sub_files
             total_folders += sub_folders + 1
+            total_size += sub_size
             for key, value in sub_counts.items():
                 type_counts[key] += value
             continue
@@ -111,7 +189,14 @@ def analyze_folder(folder_id, visited=None):
         ext = entry["name"].rsplit(".", 1)[-1].lower() if "." in entry["name"] else "no_extension"
         type_counts[ext] += 1
 
-    return total_files, total_folders, type_counts
+        file_size = get_public_file_size(entry["resource_id"])
+        if file_size is not None:
+            total_size += file_size
+
+    if entries:
+        print_progress("scan complete", current=len(entries), total=len(entries), files=total_files, folders=total_folders)
+
+    return total_files, total_folders, type_counts, total_size
 
 
 if __name__ == "__main__":
@@ -128,7 +213,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        total_files, total_folders, type_counts = analyze_folder(folder_id)
+        total_files, total_folders, type_counts, total_size = analyze_folder(folder_id)
     except RuntimeError as exc:
         print(f"Network/API error while reading folder: {exc}")
         sys.exit(1)
@@ -139,6 +224,8 @@ if __name__ == "__main__":
     print("\n===== DRIVE FOLDER ANALYSIS =====")
     print(f"Total Folders: {total_folders}")
     print(f"Total Files: {total_files}")
+    print(f"Total Size: {total_size} bytes")
+    print(f"Total Size: {round(total_size / (1024**3), 2)} GB")
     print("\nFile Types:")
     for file_type, count in sorted(type_counts.items()):
         print(f"{file_type}: {count}")
