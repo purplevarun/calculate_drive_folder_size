@@ -3,6 +3,9 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 def load_url_from_env_or_cli(argv):
@@ -102,39 +105,41 @@ def parse_entries(html):
     return entries
 
 
-def get_public_file_size(file_id):
+def parse_size_from_headers(headers):
+    content_range = headers.get("Content-Range")
+    if content_range:
+        match = re.search(r"/(\d+)$", content_range.strip())
+        if match:
+            return int(match.group(1))
+
+    content_length = headers.get("Content-Length")
+    if content_length and content_length.isdigit():
+        return int(content_length)
+
+    return None
+
+
+def get_public_file_size(file_id, timeout=12, retries=1):
     url = f"https://drive.google.com/uc?export=view&id={file_id}"
-    proc = subprocess.run(
-        [
-            "curl",
-            "-sSL",
-            "--connect-timeout",
-            "20",
-            "--max-time",
-            "90",
-            "-A",
-            "Mozilla/5.0",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{size_download}",
-            url,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        return None
 
-    stdout = proc.stdout.strip()
-    if not stdout:
-        return None
+    for _ in range(retries + 1):
+        try:
+            # Range request asks for only 1 byte, then uses Content-Range total size.
+            request = Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Range": "bytes=0-0",
+                },
+            )
+            with urlopen(request, timeout=timeout) as response:
+                size = parse_size_from_headers(response.headers)
+                if size is not None:
+                    return size
+        except (HTTPError, URLError, TimeoutError, OSError):
+            continue
 
-    try:
-        return int(stdout)
-    except ValueError:
-        return None
+    return None
 
 
 def print_progress(message, current=None, total=None, files=None, folders=None):
@@ -148,19 +153,19 @@ def print_progress(message, current=None, total=None, files=None, folders=None):
     print(" | ".join(parts), flush=True)
 
 
-def analyze_folder(folder_id, visited=None, progress_every=50):
+def collect_folder_data(folder_id, visited=None, progress_every=50):
     if visited is None:
         visited = set()
     if folder_id in visited:
-        return 0, 0, defaultdict(int), 0
+        return 0, 0, defaultdict(int), []
 
     visited.add(folder_id)
     entries = parse_entries(fetch_folder_html(folder_id))
 
     total_files = 0
     total_folders = 0
-    total_size = 0
     type_counts = defaultdict(int)
+    file_ids = []
 
     if entries:
         print_progress("scan started", current=0, total=len(entries), files=0, folders=0)
@@ -177,10 +182,10 @@ def analyze_folder(folder_id, visited=None, progress_every=50):
             )
 
         if entry["is_folder"]:
-            sub_files, sub_folders, sub_counts, sub_size = analyze_folder(entry["resource_id"], visited, progress_every)
+            sub_files, sub_folders, sub_counts, sub_file_ids = collect_folder_data(entry["resource_id"], visited, progress_every)
             total_files += sub_files
             total_folders += sub_folders + 1
-            total_size += sub_size
+            file_ids.extend(sub_file_ids)
             for key, value in sub_counts.items():
                 type_counts[key] += value
             continue
@@ -188,15 +193,38 @@ def analyze_folder(folder_id, visited=None, progress_every=50):
         total_files += 1
         ext = entry["name"].rsplit(".", 1)[-1].lower() if "." in entry["name"] else "no_extension"
         type_counts[ext] += 1
-
-        file_size = get_public_file_size(entry["resource_id"])
-        if file_size is not None:
-            total_size += file_size
+        file_ids.append(entry["resource_id"])
 
     if entries:
         print_progress("scan complete", current=len(entries), total=len(entries), files=total_files, folders=total_folders)
 
-    return total_files, total_folders, type_counts, total_size
+    return total_files, total_folders, type_counts, file_ids
+
+
+def sum_file_sizes_concurrently(file_ids, workers=64, progress_every=250):
+    if not file_ids:
+        return 0
+
+    unique_file_ids = list(dict.fromkeys(file_ids))
+    total_size = 0
+    completed = 0
+    total = len(unique_file_ids)
+
+    print_progress("size fetch started", current=0, total=total)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(get_public_file_size, file_id) for file_id in unique_file_ids]
+        for future in as_completed(futures):
+            completed += 1
+            file_size = future.result()
+            if file_size is not None:
+                total_size += file_size
+
+            if completed % progress_every == 0 or completed == total:
+                print_progress("fetching sizes", current=completed, total=total)
+
+    print_progress("size fetch complete", current=total, total=total)
+    return total_size
 
 
 if __name__ == "__main__":
@@ -213,7 +241,13 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        total_files, total_folders, type_counts, total_size = analyze_folder(folder_id)
+        total_files, total_folders, type_counts, file_ids = collect_folder_data(folder_id)
+        worker_count = int(os.environ.get("SIZE_WORKERS", "64"))
+        if worker_count < 1:
+            worker_count = 1
+        max_workers = min(128, len(file_ids) if file_ids else 1)
+        worker_count = min(worker_count, max_workers)
+        total_size = sum_file_sizes_concurrently(file_ids, workers=worker_count)
     except RuntimeError as exc:
         print(f"Network/API error while reading folder: {exc}")
         sys.exit(1)

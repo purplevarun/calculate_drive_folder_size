@@ -25,4 +25,4 @@ jobs:
         run: chmod +x ./run
 
       - name: Run public folder size scan
-        run: ./run find "${{ inputs.folder_url }}"
+        run: SIZE_WORKERS=96 ./run find "${{ inputs.folder_url }}"
