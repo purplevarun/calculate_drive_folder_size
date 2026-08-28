@@ -1,0 +1,31 @@
+name: Public Drive Folder Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder_url:
+        description: Public Google Drive folder URL
+        required: true
+        type: string
+
+jobs:
+  scan-folder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      all_proxy: ""
+      NO_PROXY: "*"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Make run script executable
+        run: chmod +x ./run
+
+      - name: Run public folder size scan
+        run: ./run find "${{ inputs.folder_url }}"
